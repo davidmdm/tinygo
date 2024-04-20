@@ -431,7 +431,6 @@ func (v Value) Float32() float32 {
 
 	case Float64:
 		return float32(v.Float())
-
 	}
 
 	panic(&ValueError{Method: "Float", Kind: v.Kind()})
@@ -1002,7 +1001,7 @@ func (v Value) MapIndex(key Value) Value {
 		} else {
 			keyptr = unsafe.Pointer(&key.value)
 		}
-		//TODO(dgryski): zero out padding bytes in key, if any
+		// TODO(dgryski): zero out padding bytes in key, if any
 		if ok := hashmapBinaryGet(v.pointer(), keyptr, elem.value, elemType.Size()); !ok {
 			return Value{}
 		}
@@ -1275,7 +1274,6 @@ func (v Value) Convert(t Type) Value {
 }
 
 func convertOp(src Value, typ Type) (Value, bool) {
-
 	// Easy check first.  Do we even need to do anything?
 	if src.typecode.underlying() == typ.(*rawType).underlying() {
 		return Value{
@@ -1846,7 +1844,6 @@ func (v Value) SetMapIndex(key, elem Value) {
 			}
 			hashmapStringSet(v.pointer(), *(*string)(key.value), elemptr)
 		}
-
 	} else if key.typecode.isBinary() {
 		var keyptr unsafe.Pointer
 		if key.isIndirect() || key.typecode.Size() > unsafe.Sizeof(uintptr(0)) {
@@ -1937,7 +1934,6 @@ func hashmapMake(keySize, valueSize uintptr, sizeHint uintptr, alg uint8) unsafe
 // MakeMapWithSize creates a new map with the specified type and initial space
 // for approximately n elements.
 func MakeMapWithSize(typ Type, n int) Value {
-
 	// TODO(dgryski): deduplicate these?  runtime and reflect both need them.
 	const (
 		hashmapAlgorithmBinary uint8 = iota
@@ -2029,4 +2025,20 @@ func (v Value) Recv() (x Value, ok bool) {
 
 func NewAt(typ Type, p unsafe.Pointer) Value {
 	panic("unimplemented: reflect.New()")
+}
+
+// SetIterKey assigns to v the key of iter's current map entry.
+// It is equivalent to v.Set(iter.Key()), but it avoids allocating a new Value.
+// As in Go, the key must be assignable to v's type and
+// must not be derived from an unexported field.
+func (v Value) SetIterKey(iter *MapIter) {
+	panic("reflect: Value.SetIterKey not implemented")
+}
+
+// SetIterValue assigns to v the value of iter's current map entry.
+// It is equivalent to v.Set(iter.Value()), but it avoids allocating a new Value.
+// As in Go, the value must be assignable to v's type and
+// must not be derived from an unexported field.
+func (v Value) SetIterValue(iter *MapIter) {
+	panic("reflect: Value.SetIterValue not implemented")
 }

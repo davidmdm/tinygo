@@ -16,7 +16,6 @@ package tls
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 )
 
@@ -24,7 +23,7 @@ import (
 // using conn as the underlying transport.
 // The config cannot be nil: users must set either ServerName or
 // InsecureSkipVerify in the config.
-func Client(conn net.Conn, config *Config) *net.TLSConn {
+func Client(conn net.Conn, config *Config) *Conn {
 	panic("tls.Client() not implemented")
 	return nil
 }
@@ -56,14 +55,8 @@ func NewListener(inner net.Listener, config *Config) net.Listener {
 //
 // DialWithDialer uses context.Background internally; to specify the context,
 // use Dialer.DialContext with NetDialer set to the desired dialer.
-func DialWithDialer(dialer *net.Dialer, network, addr string, config *Config) (*net.TLSConn, error) {
-	switch network {
-	case "tcp", "tcp4":
-	default:
-		return nil, fmt.Errorf("Network %s not supported", network)
-	}
-
-	return net.DialTLS(addr)
+func DialWithDialer(dialer *net.Dialer, network, addr string, config *Config) (*Conn, error) {
+	return nil, errors.New("tls: DialWithDialer not implemented")
 }
 
 // Dial connects to the given network address using net.Dial
@@ -72,7 +65,7 @@ func DialWithDialer(dialer *net.Dialer, network, addr string, config *Config) (*
 // Dial interprets a nil configuration as equivalent to
 // the zero configuration; see the documentation of Config
 // for the defaults.
-func Dial(network, addr string, config *Config) (*net.TLSConn, error) {
+func Dial(network, addr string, config *Config) (*Conn, error) {
 	return DialWithDialer(new(net.Dialer), network, addr, config)
 }
 
@@ -111,4 +104,11 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 // be nil because the parsed form of the certificate is not retained.
 func LoadX509KeyPair(certFile, keyFile string) (Certificate, error) {
 	return Certificate{}, errors.New("tls:LoadX509KeyPair not implemented")
+}
+
+// X509KeyPair parses a public/private key pair from a pair of
+// PEM encoded data. On successful return, Certificate.Leaf will be nil because
+// the parsed form of the certificate is not retained.
+func X509KeyPair(certPEMBlock, keyPEMBlock []byte) (Certificate, error) {
+	return Certificate{}, errors.New("tls: X509KeyPair not implemented")
 }

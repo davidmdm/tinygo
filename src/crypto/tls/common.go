@@ -7,12 +7,16 @@
 package tls
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/x509"
+	"errors"
+	"hash"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,7 +29,81 @@ type CurveID uint16
 
 // ConnectionState records basic TLS details about the connection.
 type ConnectionState struct {
-	// TINYGO: empty; TLS connection offloaded to device
+	// Version is the TLS version used by the connection (e.g. VersionTLS12).
+	Version uint16
+
+	// HandshakeComplete is true if the handshake has concluded.
+	HandshakeComplete bool
+
+	// DidResume is true if this connection was successfully resumed from a
+	// previous session with a session ticket or similar mechanism.
+	DidResume bool
+
+	// CipherSuite is the cipher suite negotiated for the connection (e.g.
+	// TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_AES_128_GCM_SHA256).
+	CipherSuite uint16
+
+	// NegotiatedProtocol is the application protocol negotiated with ALPN.
+	NegotiatedProtocol string
+
+	// NegotiatedProtocolIsMutual used to indicate a mutual NPN negotiation.
+	//
+	// Deprecated: this value is always true.
+	NegotiatedProtocolIsMutual bool
+
+	// ServerName is the value of the Server Name Indication extension sent by
+	// the client. It's available both on the server and on the client side.
+	ServerName string
+
+	// PeerCertificates are the parsed certificates sent by the peer, in the
+	// order in which they were sent. The first element is the leaf certificate
+	// that the connection is verified against.
+	//
+	// On the client side, it can't be empty. On the server side, it can be
+	// empty if Config.ClientAuth is not RequireAnyClientCert or
+	// RequireAndVerifyClientCert.
+	//
+	// PeerCertificates and its contents should not be modified.
+	PeerCertificates []*x509.Certificate
+
+	// VerifiedChains is a list of one or more chains where the first element is
+	// PeerCertificates[0] and the last element is from Config.RootCAs (on the
+	// client side) or Config.ClientCAs (on the server side).
+	//
+	// On the client side, it's set if Config.InsecureSkipVerify is false. On
+	// the server side, it's set if Config.ClientAuth is VerifyClientCertIfGiven
+	// (and the peer provided a certificate) or RequireAndVerifyClientCert.
+	//
+	// VerifiedChains and its contents should not be modified.
+	VerifiedChains [][]*x509.Certificate
+
+	// SignedCertificateTimestamps is a list of SCTs provided by the peer
+	// through the TLS handshake for the leaf certificate, if any.
+	SignedCertificateTimestamps [][]byte
+
+	// OCSPResponse is a stapled Online Certificate Status Protocol (OCSP)
+	// response provided by the peer for the leaf certificate, if any.
+	OCSPResponse []byte
+
+	// TLSUnique contains the "tls-unique" channel binding value (see RFC 5929,
+	// Section 3). This value will be nil for TLS 1.3 connections and for
+	// resumed connections that don't support Extended Master Secret (RFC 7627).
+	TLSUnique []byte
+
+	// ekm is a closure exposed via ExportKeyingMaterial.
+	ekm func(label string, context []byte, length int) ([]byte, error)
+}
+
+// ConnectionState returns basic TLS details about the connection.
+func (c *Conn) ConnectionState() ConnectionState {
+	panic("tinygo: unimplemented")
+}
+
+// NetConn returns the underlying connection that is wrapped by c.
+// Note that writing to or reading from this connection directly will corrupt the
+// TLS session.
+func (c *Conn) NetConn() net.Conn {
+	return c.conn
 }
 
 // ClientAuthType declares the policy the server will follow for
@@ -415,6 +493,12 @@ type Config struct {
 	autoSessionTicketKeys []ticketKey
 }
 
+// Clone returns a shallow clone of c or nil if c is nil. It is safe to clone a [Config] that is
+// being used concurrently by a TLS client or server.
+func (c *Config) Clone() *Config {
+	panic("tls: Config.Clone not implemented")
+}
+
 // ticketKey is the internal representation of a session ticket key.
 type ticketKey struct {
 	aesKey  [16]byte
@@ -445,3 +529,288 @@ type Certificate struct {
 	// the leaf certificate will be parsed as needed.
 	Leaf *x509.Certificate
 }
+
+// A QUICEventKind is a type of operation on a QUIC connection.
+type QUICEventKind int
+
+// QUICEncryptionLevel represents a QUIC encryption level used to transmit
+// handshake messages.
+type QUICEncryptionLevel int
+
+// A QUICEvent is an event occurring on a QUIC connection.
+//
+// The type of event is specified by the Kind field.
+// The contents of the other fields are kind-specific.
+type QUICEvent struct {
+	Kind QUICEventKind
+
+	// Set for QUICSetReadSecret, QUICSetWriteSecret, and QUICWriteData.
+	Level QUICEncryptionLevel
+
+	// Set for QUICTransportParameters, QUICSetReadSecret, QUICSetWriteSecret, and QUICWriteData.
+	// The contents are owned by crypto/tls, and are valid until the next NextEvent call.
+	Data []byte
+
+	// Set for QUICSetReadSecret and QUICSetWriteSecret.
+	Suite uint16
+}
+
+type quicState struct {
+	events    []QUICEvent
+	nextEvent int
+
+	// eventArr is a statically allocated event array, large enough to handle
+	// the usual maximum number of events resulting from a single call: transport
+	// parameters, Initial data, Early read secret, Handshake write and read
+	// secrets, Handshake data, Application write secret, Application data.
+	eventArr [8]QUICEvent
+
+	started  bool
+	signalc  chan struct{}   // handshake data is available to be read
+	blockedc chan struct{}   // handshake is waiting for data, closed when done
+	cancelc  <-chan struct{} // handshake has been canceled
+	cancel   context.CancelFunc
+
+	// readbuf is shared between HandleData and the handshake goroutine.
+	// HandshakeCryptoData passes ownership to the handshake goroutine by
+	// reading from signalc, and reclaims ownership by reading from blockedc.
+	readbuf []byte
+
+	transportParams []byte // to send to the peer
+}
+
+// activeCert is a handle to a certificate held in the cache. Once there are
+// no alive activeCerts for a given certificate, the certificate is removed
+// from the cache by a finalizer.
+type activeCert struct {
+	cert *x509.Certificate
+}
+
+// A halfConn represents one direction of the record layer
+// connection, either sending or receiving.
+type halfConn struct {
+	sync.Mutex
+
+	err     error  // first permanent error
+	version uint16 // protocol version
+	cipher  any    // cipher algorithm
+	mac     hash.Hash
+	seq     [8]byte // 64-bit sequence number
+
+	scratchBuf [13]byte // to avoid allocs; interface method args escape
+
+	nextCipher any       // next encryption state
+	nextMac    hash.Hash // next MAC algorithm
+
+	level         QUICEncryptionLevel // current QUIC encryption level
+	trafficSecret []byte              // current TLS 1.3 traffic secret
+}
+
+// A Conn represents a secured connection.
+// It implements the net.Conn interface.
+type Conn struct {
+	// constant
+	conn        net.Conn
+	isClient    bool
+	handshakeFn func(context.Context) error // (*Conn).clientHandshake or serverHandshake
+	quic        *quicState                  // nil for non-QUIC connections
+
+	// isHandshakeComplete is true if the connection is currently transferring
+	// application data (i.e. is not currently processing a handshake).
+	// isHandshakeComplete is true implies handshakeErr == nil.
+	isHandshakeComplete atomic.Bool
+	// constant after handshake; protected by handshakeMutex
+	handshakeMutex sync.Mutex
+	handshakeErr   error   // error resulting from handshake
+	vers           uint16  // TLS version
+	haveVers       bool    // version has been negotiated
+	config         *Config // configuration passed to constructor
+	// handshakes counts the number of handshakes performed on the
+	// connection so far. If renegotiation is disabled then this is either
+	// zero or one.
+	handshakes       int
+	extMasterSecret  bool
+	didResume        bool // whether this connection was a session resumption
+	cipherSuite      uint16
+	ocspResponse     []byte   // stapled OCSP response
+	scts             [][]byte // signed certificate timestamps from server
+	peerCertificates []*x509.Certificate
+	// activeCertHandles contains the cache handles to certificates in
+	// peerCertificates that are used to track active references.
+	activeCertHandles []*activeCert
+	// verifiedChains contains the certificate chains that we built, as
+	// opposed to the ones presented by the server.
+	verifiedChains [][]*x509.Certificate
+	// serverName contains the server name indicated by the client, if any.
+	serverName string
+	// secureRenegotiation is true if the server echoed the secure
+	// renegotiation extension. (This is meaningless as a server because
+	// renegotiation is not supported in that case.)
+	secureRenegotiation bool
+	// ekm is a closure for exporting keying material.
+	ekm func(label string, context []byte, length int) ([]byte, error)
+	// resumptionSecret is the resumption_master_secret for handling
+	// or sending NewSessionTicket messages.
+	resumptionSecret []byte
+
+	// ticketKeys is the set of active session ticket keys for this
+	// connection. The first one is used to encrypt new tickets and
+	// all are tried to decrypt tickets.
+	ticketKeys []ticketKey
+
+	// clientFinishedIsFirst is true if the client sent the first Finished
+	// message during the most recent handshake. This is recorded because
+	// the first transmitted Finished message is the tls-unique
+	// channel-binding value.
+	clientFinishedIsFirst bool
+
+	// closeNotifyErr is any error from sending the alertCloseNotify record.
+	closeNotifyErr error
+	// closeNotifySent is true if the Conn attempted to send an
+	// alertCloseNotify record.
+	closeNotifySent bool
+
+	// clientFinished and serverFinished contain the Finished message sent
+	// by the client or server in the most recent handshake. This is
+	// retained to support the renegotiation extension and tls-unique
+	// channel-binding.
+	clientFinished [12]byte
+	serverFinished [12]byte
+
+	// clientProtocol is the negotiated ALPN protocol.
+	clientProtocol string
+
+	// input/output
+	in, out   halfConn
+	rawInput  bytes.Buffer // raw input, starting with a record header
+	input     bytes.Reader // application data waiting to be read, from rawInput.Next
+	hand      bytes.Buffer // handshake data waiting to be read
+	buffering bool         // whether records are buffered in sendBuf
+	sendBuf   []byte       // a buffer of records waiting to be sent
+
+	// bytesSent counts the bytes of application data sent.
+	// packetsSent counts packets.
+	bytesSent   int64
+	packetsSent int64
+
+	// retryCount counts the number of consecutive non-advancing records
+	// received by Conn.readRecord. That is, records that neither advance the
+	// handshake, nor deliver application data. Protected by in.Mutex.
+	retryCount int
+
+	// activeCall indicates whether Close has been call in the low bit.
+	// the rest of the bits are the number of goroutines in Conn.Write.
+	activeCall atomic.Int32
+
+	tmp [16]byte
+}
+
+// Close closes the connection.
+func (c *Conn) Close() error {
+	return errors.New("tls: Conn.Close not implemented")
+}
+
+// LocalAddr returns the local network address.
+func (c *Conn) LocalAddr() net.Addr {
+	return c.conn.LocalAddr()
+}
+
+// Read reads data from the connection.
+//
+// As Read calls [Conn.Handshake], in order to prevent indefinite blocking a deadline
+// must be set for both Read and [Conn.Write] before Read is called when the handshake
+// has not yet completed. See [Conn.SetDeadline], [Conn.SetReadDeadline], and
+// [Conn.SetWriteDeadline].
+func (c *Conn) Read(b []byte) (int, error) {
+	return 0, errors.New("tls: Conn.Read not implemented")
+}
+
+// Write writes data to the connection.
+//
+// As Write calls [Conn.Handshake], in order to prevent indefinite blocking a deadline
+// must be set for both [Conn.Read] and Write before Write is called when the handshake
+// has not yet completed. See [Conn.SetDeadline], [Conn.SetReadDeadline], and
+// [Conn.SetWriteDeadline].
+func (c *Conn) Write(b []byte) (int, error) {
+	return 0, errors.New("tls: Conn.Write not implemented")
+}
+
+// RemoteAddr returns the remote network address.
+func (c *Conn) RemoteAddr() net.Addr {
+	return c.conn.RemoteAddr()
+}
+
+// SetDeadline sets the read and write deadlines associated with the connection.
+// A zero value for t means [Conn.Read] and [Conn.Write] will not time out.
+// After a Write has timed out, the TLS state is corrupt and all future writes will return the same error.
+func (c *Conn) SetDeadline(t time.Time) error {
+	return c.conn.SetDeadline(t)
+}
+
+// SetReadDeadline sets the read deadline on the underlying connection.
+// A zero value for t means [Conn.Read] will not time out.
+func (c *Conn) SetReadDeadline(t time.Time) error {
+	return c.conn.SetReadDeadline(t)
+}
+
+// SetWriteDeadline sets the write deadline on the underlying connection.
+// A zero value for t means [Conn.Write] will not time out.
+// After a [Conn.Write] has timed out, the TLS state is corrupt and all future writes will return the same error.
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	return c.conn.SetWriteDeadline(t)
+}
+
+const (
+	VersionTLS10 = 0x0301
+	VersionTLS11 = 0x0302
+	VersionTLS12 = 0x0303
+	VersionTLS13 = 0x0304
+
+	// Deprecated: SSLv3 is cryptographically broken, and is no longer
+	// supported by this package. See golang.org/issue/32716.
+	VersionSSL30 = 0x0300
+)
+
+// A list of cipher suite IDs that are, or have been, implemented by this
+// package.
+//
+// See https://www.iana.org/assignments/tls-parameters/tls-parameters.xml
+const (
+	// TLS 1.0 - 1.2 cipher suites.
+	TLS_RSA_WITH_RC4_128_SHA                      uint16 = 0x0005
+	TLS_RSA_WITH_3DES_EDE_CBC_SHA                 uint16 = 0x000a
+	TLS_RSA_WITH_AES_128_CBC_SHA                  uint16 = 0x002f
+	TLS_RSA_WITH_AES_256_CBC_SHA                  uint16 = 0x0035
+	TLS_RSA_WITH_AES_128_CBC_SHA256               uint16 = 0x003c
+	TLS_RSA_WITH_AES_128_GCM_SHA256               uint16 = 0x009c
+	TLS_RSA_WITH_AES_256_GCM_SHA384               uint16 = 0x009d
+	TLS_ECDHE_ECDSA_WITH_RC4_128_SHA              uint16 = 0xc007
+	TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA          uint16 = 0xc009
+	TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA          uint16 = 0xc00a
+	TLS_ECDHE_RSA_WITH_RC4_128_SHA                uint16 = 0xc011
+	TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA           uint16 = 0xc012
+	TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA            uint16 = 0xc013
+	TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA            uint16 = 0xc014
+	TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256       uint16 = 0xc023
+	TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256         uint16 = 0xc027
+	TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256         uint16 = 0xc02f
+	TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256       uint16 = 0xc02b
+	TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384         uint16 = 0xc030
+	TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384       uint16 = 0xc02c
+	TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256   uint16 = 0xcca8
+	TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 uint16 = 0xcca9
+
+	// TLS 1.3 cipher suites.
+	TLS_AES_128_GCM_SHA256       uint16 = 0x1301
+	TLS_AES_256_GCM_SHA384       uint16 = 0x1302
+	TLS_CHACHA20_POLY1305_SHA256 uint16 = 0x1303
+
+	// TLS_FALLBACK_SCSV isn't a standard cipher suite but an indicator
+	// that the client is doing version fallback. See RFC 7507.
+	TLS_FALLBACK_SCSV uint16 = 0x5600
+
+	// Legacy names for the corresponding cipher suites with the correct _SHA256
+	// suffix, retained for backward compatibility.
+	TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305   = TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+	TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305 = TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+)

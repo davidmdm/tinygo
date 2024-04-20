@@ -39,3 +39,23 @@ type User struct {
 func Current() (*User, error) {
 	return nil, errors.New("user: Current not implemented")
 }
+
+// LookupId looks up a user by userid. If the user cannot be found, the
+// returned error is of type UnknownUserIdError.
+func LookupId(uid string) (*User, error) {
+	return nil, errors.New("user: LookupId not implemented")
+}
+
+// Group represents a grouping of users.
+//
+// On POSIX systems Gid contains a decimal number representing the group ID.
+type Group struct {
+	Gid  string // group ID
+	Name string // group name
+}
+
+// LookupGroupId looks up a group by groupid. If the group cannot be found, the
+// returned error is of type UnknownGroupIdError.
+func LookupGroupId(gid string) (*Group, error) {
+	return nil, errors.New("user: LookupGroupId not implemented")
+}
